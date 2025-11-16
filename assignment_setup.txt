@@ -1,0 +1,664 @@
+# Complete Guide: Deploying Microservices with Signoz Observability on Kubernetes (Windows WSL)
+
+## Prerequisites Setup
+
+### 1. Install Ubuntu WSL
+```bash
+# In Windows PowerShell (as Administrator)
+wsl --install -d Ubuntu
+```
+
+### 2. Install Docker Desktop
+- Download and install Docker Desktop for Windows
+- Enable Kubernetes in Docker Desktop settings:
+  - Open Docker Desktop → Settings → Kubernetes
+  - Check "Enable Kubernetes"
+  - Click "Apply & Restart"
+
+### 3. Open Ubuntu Terminal
+Launch Ubuntu from Windows Start menu
+
+---
+
+## PHASE 1: Install Required Tools
+
+### Install kubectl
+```bash
+sudo apt update
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+chmod +x kubectl
+sudo mv kubectl /usr/local/bin/kubectl
+kubectl version --client
+```
+
+### Install Helm
+```bash
+curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+helm version
+```
+
+### Install Git
+```bash
+sudo apt install git -y
+git --version
+```
+
+---
+
+## PHASE 2: Deploy Google Microservices Demo
+
+### Clone the Repository
+```bash
+cd ~
+git clone https://github.com/GoogleCloudPlatform/microservices-demo.git
+cd microservices-demo
+```
+
+### Deploy to Kubernetes
+```bash
+kubectl apply -f ./release/kubernetes-manifests.yaml
+```
+
+### Verify Deployment
+```bash
+# Check all pods are running (this may take 2-3 minutes)
+kubectl get pods -n default
+
+# Expected output: All pods should show 1/1 READY and STATUS Running
+```
+
+### Test the Application
+```bash
+# In a separate terminal, expose the frontend
+kubectl port-forward deployment/frontend 8080:8080
+```
+
+Open browser: **http://localhost:8080**  
+You should see the "Online Boutique" e-commerce application.
+
+---
+
+## PHASE 3: Install Signoz Observability Platform
+
+### Step 1: Add Signoz Helm Repository
+```bash
+helm repo add signoz https://charts.signoz.io
+helm repo update
+```
+
+### Step 2: Create Signoz Namespace
+```bash
+kubectl create namespace signoz
+```
+
+### Step 3: Install Signoz
+```bash
+helm install signoz signoz/signoz -n signoz
+```
+
+**What gets installed:**
+- Query Service (backend API)
+- Frontend UI
+- OpenTelemetry Collector (receives telemetry data)
+- ClickHouse (time-series database)
+- AlertManager
+- Zookeeper (for ClickHouse coordination)
+
+### Step 4: Wait for Pods to be Ready
+```bash
+kubectl get pods -n signoz
+
+# Wait until all pods show Running status
+# This typically takes 3-5 minutes
+```
+
+### Step 5: Expose Signoz UI
+```bash
+# In a separate terminal
+kubectl port-forward -n signoz svc/signoz 5555:8080
+```
+
+Open browser: **http://localhost:5555**  
+You should see the Signoz welcome screen.
+
+---
+
+## PHASE 4: Install K8s Infrastructure Monitoring
+
+### Attempt 1: Install k8s-infra (Initial Attempt)
+```bash
+helm install signoz-infra signoz/k8s-infra -n signoz
+```
+
+**Issue Encountered:** The k8s-infra pods crashed with error:
+```
+Error: invalid configuration: exporters::otlp: requires a non-empty "endpoint"
+```
+
+### Solution: Uninstall and Reinstall with Configuration
+```bash
+# Uninstall broken installation
+helm uninstall signoz-infra -n signoz
+
+# Create values file with proper configuration
+cat > k8s-infra-values.yaml << 'EOF'
+otelAgent:
+  enabled: true
+  config:
+    exporters:
+      otlp:
+        endpoint: "signoz-otel-collector.signoz.svc.cluster.local:4317"
+        tls:
+          insecure: true
+
+otelDeployment:
+  enabled: true
+  config:
+    exporters:
+      otlp:
+        endpoint: "signoz-otel-collector.signoz.svc.cluster.local:4317"
+        tls:
+          insecure: true
+EOF
+
+# Reinstall with configuration
+helm install signoz-infra signoz/k8s-infra -n signoz -f k8s-infra-values.yaml
+```
+
+**Issue Encountered:** Agent pod still failing with mount errors in WSL environment.
+
+### Final Solution: Disable Agent, Keep Deployment Only
+```bash
+# Uninstall again
+helm uninstall signoz-infra -n signoz
+
+# Install with agent disabled (works better in WSL/Docker Desktop)
+helm install signoz-infra signoz/k8s-infra -n signoz \
+  --set otelAgent.enabled=false \
+  --set otelDeployment.enabled=true \
+  --set otelDeployment.config.exporters.otlp.endpoint="signoz-otel-collector.signoz.svc.cluster.local:4317" \
+  --set otelDeployment.config.exporters.otlp.tls.insecure=true
+```
+
+### Verify Installation
+```bash
+kubectl get pods -n signoz
+
+# You should see signoz-infra-k8s-infra-otel-deployment pod running
+```
+
+---
+
+## PHASE 5: Enable Tracing in Microservices
+
+### Understanding the Problem
+By default, the microservices have tracing **disabled**. When checking Signoz UI, no services appear because the applications aren't sending telemetry data.
+
+### Investigation: Finding the Right Environment Variables
+
+#### Initial Attempt (Failed)
+```bash
+# Tried setting OTEL_EXPORTER_OTLP_ENDPOINT (standard OpenTelemetry variable)
+kubectl set env deployment/frontend \
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://signoz-otel-collector.signoz.svc.cluster.local:4317
+
+# Result: Pods crashed with error:
+# panic: environment variable "COLLECTOR_SERVICE_ADDR" not set
+```
+
+**Learning:** The microservices use custom variable names, not standard OpenTelemetry ones.
+
+#### Checking the Source Code
+```bash
+cd ~/microservices-demo/src/frontend
+
+# Search for tracing-related variables
+grep -r "COLLECTOR_SERVICE_ADDR" .
+grep -r "DISABLE_TRACING" .
+grep -r "Tracing enabled" .
+
+# Output showed:
+# ./main.go:      mustMapEnv(&svc.collectorAddr, "COLLECTOR_SERVICE_ADDR")
+# ./main.go:              log.Info("Tracing enabled.")
+# ./main.go:              log.Info("Tracing disabled.")
+```
+
+#### Finding the Enable Flag
+```bash
+# Check how tracing is initialized
+cat main.go | grep -A 20 -B 5 "COLLECTOR_SERVICE_ADDR"
+
+# Found the key logic:
+# if os.Getenv("ENABLE_TRACING") == "1" {
+#     log.Info("Tracing enabled.")
+#     initTracing(log, ctx, svc)
+# } else {
+#     log.Info("Tracing disabled.")
+# }
+```
+
+**Discovery:** The applications need **TWO** environment variables:
+1. `ENABLE_TRACING=1` - to enable tracing
+2. `COLLECTOR_SERVICE_ADDR=<endpoint>` - to specify where to send traces
+
+### Correct Solution: Enable Tracing
+```bash
+cd ~/microservices-demo
+
+# Create script to enable tracing for all services
+cat > patch-tracing.sh << 'EOF'
+#!/bin/bash
+
+SERVICES="frontend cartservice productcatalogservice checkoutservice recommendationservice shippingservice currencyservice paymentservice emailservice adservice"
+
+for SERVICE in $SERVICES; do
+  echo "Enabling tracing for $SERVICE..."
+  
+  kubectl set env deployment/$SERVICE \
+    ENABLE_TRACING=1 \
+    COLLECTOR_SERVICE_ADDR=signoz-otel-collector.signoz.svc.cluster.local:4317
+  
+  echo "✓ Patched $SERVICE"
+done
+
+echo ""
+echo "Done! Waiting for pods to restart..."
+sleep 10
+kubectl get pods -n default
+EOF
+
+chmod +x patch-tracing.sh
+./patch-tracing.sh
+```
+
+### Handle Service-Specific Issues
+
+**Issue:** currencyservice and paymentservice crashed after adding tracing variables.
+
+**Reason:** These services are written in different languages (Node.js and Python) and may have different tracing implementations or requirements.
+
+**Solution:** Rollback just those two services:
+```bash
+kubectl rollout undo deployment/currencyservice
+kubectl rollout undo deployment/paymentservice
+```
+
+### Verify Tracing is Enabled
+```bash
+# Check frontend logs
+kubectl logs deployment/frontend | grep -i trac
+
+# Expected output:
+# {"message":"Tracing enabled.","severity":"info",...}
+
+# Check other services
+kubectl logs deployment/checkoutservice | grep -i trac
+kubectl logs deployment/cartservice | grep -i trac
+kubectl logs deployment/productcatalogservice | grep -i trac
+```
+
+---
+
+## PHASE 6: Generate Traffic with Locust
+
+### Install Locust
+```bash
+sudo apt install python3-pip -y
+pip install locust
+```
+
+### Create Load Test File
+```bash
+cd ~
+nano locustfile.py
+```
+
+Paste the following content:
+```python
+from locust import HttpUser, task, between
+
+class DemoUser(HttpUser):
+    wait_time = between(1, 2)
+    
+    @task
+    def browse_home(self):
+        self.client.get("/")
+```
+
+Save and exit (Ctrl+O, Enter, Ctrl+X)
+
+### Run Load Test
+```bash
+locust -f locustfile.py --host=http://localhost:8080
+```
+
+Open browser: **http://localhost:8089**
+
+Configure the load test:
+- Number of users: **10**
+- Spawn rate: **1** user per second
+- Click **"Start swarming"**
+
+---
+
+## PHASE 7: View Observability Data in Signoz
+
+### Ensure Port Forwards are Running
+
+Open **three separate terminal windows**:
+
+**Terminal 1 - Frontend Application:**
+```bash
+kubectl port-forward deployment/frontend 8080:8080
+```
+
+**Terminal 2 - Signoz UI:**
+```bash
+kubectl port-forward -n signoz svc/signoz 5555:8080
+```
+
+**Terminal 3 - Load Generator:**
+```bash
+locust -f ~/locustfile.py --host=http://localhost:8080
+```
+
+### Access Signoz Dashboard
+
+Open browser: **http://localhost:5555**
+
+Wait 2-3 minutes for data to flow, then explore:
+
+#### 1. Services Tab
+- Click **"Services"** in the left sidebar
+- You should see microservices:
+  - frontend
+  - cartservice
+  - checkoutservice
+  - productcatalogservice
+  - recommendationservice
+  - shippingservice
+  - adservice
+  - emailservice
+
+#### 2. Traces Tab
+- Click **"Traces"** in the left sidebar
+- View distributed traces showing request flow across services
+- Click on any trace to see:
+  - Complete request journey
+  - Time spent in each service
+  - Service dependencies
+  - Latency breakdown
+
+#### 3. Metrics Tab
+- View service-level metrics:
+  - Request rate (requests/second)
+  - Error rate (percentage)
+  - Latency percentiles (P50, P90, P99)
+  - Apdex score
+
+#### 4. Logs Tab
+- Click **"Logs"** → **"Explore Logs"**
+- View Kubernetes event logs
+- Filter by:
+  - Service name
+  - Severity level
+  - Time range
+  - Custom queries
+
+#### 5. Infrastructure Metrics
+- View Kubernetes cluster metrics:
+  - Node CPU/Memory usage
+  - Pod resource consumption
+  - Container metrics
+
+---
+
+## Troubleshooting Guide
+
+### Issue 1: Pods Not Starting
+```bash
+# Check pod status
+kubectl get pods -n default
+
+# Check pod details
+kubectl describe pod <pod-name> -n default
+
+# Check logs
+kubectl logs <pod-name> -n default
+```
+
+### Issue 2: No Services in Signoz
+**Symptoms:** Signoz UI shows no services in the Services tab
+
+**Causes:**
+1. Tracing not enabled in microservices
+2. Incorrect environment variables
+3. Not enough traffic generated
+
+**Solution:**
+```bash
+# Verify tracing is enabled
+kubectl logs deployment/frontend | grep -i trac
+
+# Should show: "Tracing enabled"
+# If shows "Tracing disabled", review PHASE 5
+
+# Verify environment variables are set
+kubectl get deployment frontend -o yaml | grep -A 5 "env:"
+
+# Should show:
+# - name: ENABLE_TRACING
+#   value: "1"
+# - name: COLLECTOR_SERVICE_ADDR
+#   value: signoz-otel-collector.signoz.svc.cluster.local:4317
+```
+
+### Issue 3: k8s-infra Pods Crashing
+**Symptoms:** `signoz-infra-k8s-infra-otel-agent` in CrashLoopBackOff
+
+**Cause:** Volume mount issues in WSL/Docker Desktop environment
+
+**Solution:** Disable the agent component (already covered in PHASE 4)
+
+### Issue 4: Port Forward Stops Working
+```bash
+# Kill existing port forwards
+pkill -f "kubectl port-forward"
+
+# Restart them
+kubectl port-forward deployment/frontend 8080:8080 &
+kubectl port-forward -n signoz svc/signoz 5555:8080 &
+```
+
+### Issue 5: Specific Services Crashing with Tracing
+**Symptoms:** currencyservice or paymentservice in CrashLoopBackOff after enabling tracing
+
+**Solution:**
+```bash
+# Rollback specific services
+kubectl rollout undo deployment/currencyservice
+kubectl rollout undo deployment/paymentservice
+
+# Note: These services may use different tracing libraries
+# The other 8 services will still send traces
+```
+
+---
+
+## Summary of What Was Deployed
+
+### Application Stack
+- **10 microservices** (Google Cloud microservices-demo)
+  - frontend (Go)
+  - cartservice (C#)
+  - productcatalogservice (Go)
+  - checkoutservice (Go)
+  - recommendationservice (Python)
+  - shippingservice (Go)
+  - currencyservice (Node.js)
+  - paymentservice (Node.js)
+  - emailservice (Python)
+  - adservice (Java)
+  - redis-cart (Redis)
+
+### Observability Stack (Signoz)
+- **Query Service** - API backend
+- **Frontend** - Web UI
+- **OpenTelemetry Collector** - Telemetry data receiver
+- **ClickHouse** - Time-series database
+- **Zookeeper** - Coordination service
+- **k8s-infra collector** - Kubernetes metrics collector
+
+### Monitoring Capabilities
+- ✅ Distributed tracing across 8 microservices
+- ✅ Service-level metrics (latency, errors, throughput)
+- ✅ Kubernetes infrastructure metrics
+- ✅ Event logs from Kubernetes
+- ✅ Service dependency mapping
+
+---
+
+## Key Learnings
+
+### 1. Environment Variable Discovery
+- Always check source code when documentation is unclear
+- Application-specific variables may differ from standards
+- Error messages often reveal required variables
+
+### 2. Language-Specific Tracing
+- Different programming languages have different OpenTelemetry implementations
+- Not all services may support the same configuration
+- It's acceptable to have partial instrumentation
+
+### 3. WSL/Docker Desktop Limitations
+- Some Kubernetes features (like hostPath volumes) don't work well in WSL
+- DaemonSets may have mount permission issues
+- Deployment-based collectors work better than agent-based ones
+
+### 4. Observability Requires Active Traffic
+- Telemetry data only appears when services are actively used
+- Load generators are essential for testing observability setups
+- Allow 2-3 minutes for data to appear in dashboards
+
+---
+
+## Verification Checklist
+
+✅ All application pods running (except currencyservice/paymentservice if tracing enabled)  
+✅ All Signoz pods running  
+✅ Frontend accessible at http://localhost:8080  
+✅ Signoz UI accessible at http://localhost:5555  
+✅ Services visible in Signoz Services tab  
+✅ Traces visible in Signoz Traces tab  
+✅ Logs visible in Signoz Logs tab  
+✅ Load test generating traffic  
+
+---
+
+## Useful Commands Reference
+
+```bash
+# View all pods across all namespaces
+kubectl get pods -A
+
+# View logs for a specific pod
+kubectl logs <pod-name> -n <namespace>
+
+# View logs for a deployment (latest pod)
+kubectl logs deployment/<deployment-name> -n <namespace>
+
+# Follow logs in real-time
+kubectl logs -f <pod-name> -n <namespace>
+
+# Describe a pod (useful for debugging)
+kubectl describe pod <pod-name> -n <namespace>
+
+# Get deployment YAML
+kubectl get deployment <name> -n <namespace> -o yaml
+
+# Restart a deployment
+kubectl rollout restart deployment/<name> -n <namespace>
+
+# Undo last deployment change
+kubectl rollout undo deployment/<name> -n <namespace>
+
+# Scale a deployment
+kubectl scale deployment/<name> --replicas=3 -n <namespace>
+
+# Delete a deployment
+kubectl delete deployment/<name> -n <namespace>
+
+# View services
+kubectl get svc -n <namespace>
+
+# Port forward to a service
+kubectl port-forward svc/<service-name> <local-port>:<service-port> -n <namespace>
+
+# View Helm releases
+helm list -A
+
+# Uninstall Helm release
+helm uninstall <release-name> -n <namespace>
+```
+
+---
+
+## Next Steps (Optional)
+
+### 1. Create Custom Dashboards
+- In Signoz, click "Dashboards" → "New Dashboard"
+- Add panels for key metrics
+- Visualize service dependencies
+
+### 2. Set Up Alerts
+- Click "Alerts" → "New Alert"
+- Configure thresholds for latency, errors, etc.
+- Set up notification channels
+
+### 3. Explore Service Dependencies
+- View the service map to understand architecture
+- Identify bottlenecks and slow services
+- Analyze error propagation
+
+### 4. Query Traces
+- Use filters to find specific requests
+- Search by service, operation, or tags
+- Analyze slow traces (P99, P95)
+
+### 5. Instrument Remaining Services
+- Investigate why currencyservice and paymentservice failed
+- Check their specific OpenTelemetry implementation
+- Add appropriate environment variables for their language
+
+---
+
+## Cleanup (Optional)
+
+To remove everything:
+
+```bash
+# Delete microservices
+kubectl delete -f ~/microservices-demo/release/kubernetes-manifests.yaml
+
+# Delete Signoz
+helm uninstall signoz -n signoz
+helm uninstall signoz-infra -n signoz
+kubectl delete namespace signoz
+
+# Verify cleanup
+kubectl get pods -A
+```
+
+---
+
+## Conclusion
+
+You now have a fully functional observability platform monitoring a microservices application! This setup demonstrates:
+
+- Distributed tracing across multiple services
+- Real-time metrics collection and visualization
+- Log aggregation from Kubernetes
+- Infrastructure monitoring
+- Performance analysis and debugging capabilities
+
+This is a production-ready observability stack that can be adapted for your own applications.
