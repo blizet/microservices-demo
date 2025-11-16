@@ -20,9 +20,12 @@ Implement Google’s microservices-demo using Kubernetes (any cloud or self-host
 Generate traffic and visualize logs/metrics using SigNoz.
 Bonus: Add a persistence layer and save order data.
 
+**Frontend Url**
+URL: http://34.100.236.194/
+
 **🔗 SigNoz Dashboard (Deployed)**
 
-👉 URL: <YOUR_DEPLOYED_SIGNOZ_URL_HERE>
+👉 URL: http://34.47.233.63/
 (Credentials / access shared separately as required)
 
 **📸 Screenshots**
