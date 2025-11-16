@@ -5,9 +5,13 @@
 This repository implements Google’s microservices-demo application deployed on Kubernetes, with:
 
 ✅ Simulated traffic generation using Locust
+
 ✅ Visualization of logs, metrics, and traces using SigNoz
+
 ✅ Screenshots of Locust, SigNoz dashboards, and the application running locally
+
 ✅ Deployed SigNoz instance URL included
+
 🔄 (Optional Bonus – persistence layer: add order storage in a database)
 
 This work corresponds to the assignment instructions below:
